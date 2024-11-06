@@ -1,100 +1,184 @@
 import re
 import math
-
-from numpy.ma.core import not_equal
-
-#note
+import numpy as np
 
 
-class GCodePostProcessor:
-    def __init__(self, pipe_radius, bend_angle):
-        self.pipe_radius = pipe_radius
-        self.total_bend_angle = math.radians(bend_angle)
-        self.current_layer = 0
-        self.layer_height = 0
-        self.total_height = 0
-        self.layers = []
+class GCodePipeConnector:
+    def __init__(self, tilt_angle_degrees=45):
+        self.tilt_angle = math.radians(tilt_angle_degrees)
+        self.first_part_max_z = 0
+        self.pivot_x = 0
+        self.pivot_y = 0
+        self.rotation_matrix = None
+        self.min_z_second_part = float('inf')
+        self.bounding_box = {'min_x': float('inf'), 'max_x': float('-inf'),
+                             'min_y': float('inf'), 'max_y': float('-inf')}
+        self.pipe_diameter = None
+        self.wall_thickness = None
 
-    def process_file(self, input_file, output_file):
-        # First pass: analyze the G-code to determine layers and total height
-        self.analyze_gcode(input_file)
+    def analyze_first_part(self, filename):
+        """Find the maximum Z height, pipe diameter, and wall thickness from first part"""
+        max_z = 0
+        x_coords = []
+        y_coords = []
+        current_z = 0
 
-        # Calculate total height and layer angles
-        self.total_height = len(self.layers) * self.layer_height
-        self.calculate_layer_angles()
-
-        # Second pass: process the G-code with calculated angles
-        with open(input_file, 'r') as infile, open(output_file, 'w') as outfile:
-            self.current_layer = 0
-            for line in infile:
-                processed_line = self.process_line(line)
-                outfile.write(processed_line + '\n')
-
-    def analyze_gcode(self, input_file):
-        with open(input_file, 'r') as infile:
-            current_z = 0
-            for line in infile:
-                if line.startswith(';LAYER:'):
-                    self.layers.append(current_z)
-                elif line.startswith('G1 ') and 'Z' in line:
+        with open(filename, 'r') as file:
+            for line in file:
+                if line.startswith('G0 ') or line.startswith('G1 '):
                     z_match = re.search(r'Z([-\d.]+)', line)
-                    if z_match:
-                        new_z = float(z_match.group(1))
-                        if new_z > current_z:
-                            current_z = new_z
-                            if len(self.layers) == 1:
-                                self.layer_height = current_z - self.layers[0]
+                    x_match = re.search(r'X([-\d.]+)', line)
+                    y_match = re.search(r'Y([-\d.]+)', line)
 
-    def calculate_layer_angles(self):
-        for i, layer_z in enumerate(self.layers):
-            progress = layer_z / self.total_height
-            angle = progress * self.total_bend_angle
-            self.layers[i] = (layer_z, angle)
+                    if z_match:
+                        current_z = float(z_match.group(1))
+                        max_z = max(max_z, current_z)
+
+                    if x_match and y_match:
+                        x = float(x_match.group(1))
+                        y = float(y_match.group(1))
+                        x_coords.append(x)
+                        y_coords.append(y)
+
+        # Calculate pipe properties from coordinates
+        if x_coords and y_coords:
+            x_range = max(x_coords) - min(x_coords)
+            y_range = max(y_coords) - min(y_coords)
+            self.pipe_diameter = max(x_range, y_range)
+            # Assume wall thickness is 10% of diameter if not directly measurable
+            self.wall_thickness = self.pipe_diameter * 0.1
+
+        self.first_part_max_z = max_z
+        self.pivot_x = (min(x_coords) + max(x_coords)) / 2
+        self.pivot_y = (min(y_coords) + max(y_coords)) / 2
+
+    def get_transformation_matrices(self):
+        """Create transformation matrices for angled pipe connection"""
+        cos_t = math.cos(self.tilt_angle)
+        sin_t = math.sin(self.tilt_angle)
+
+        # Create rotation matrix around Y axis
+        self.rotation_matrix = np.array([
+            [cos_t, 0, sin_t],
+            [0, 1, 0],
+            [-sin_t, 0, cos_t]
+        ])
+
+    def transform_point(self, x, y, z):
+        """Transform a point using the rotation matrix with offset for pipe connection"""
+        # Calculate offset based on pipe diameter for proper connection
+        connection_offset = self.pipe_diameter * 0.5
+
+        # Adjust Z coordinate to account for connection height
+        adjusted_z = z - self.min_z_second_part
+
+        # Create point vector relative to pivot
+        point = np.array([
+            x - self.pivot_x,
+            y - self.pivot_y,
+            adjusted_z + connection_offset
+        ])
+
+        # Apply rotation
+        rotated = np.dot(self.rotation_matrix, point)
+
+        # Add offset for clean connection
+        transformed = [
+            rotated[0] + self.pivot_x,
+            rotated[1] + self.pivot_y,
+            rotated[2] + self.first_part_max_z - connection_offset * math.cos(self.tilt_angle)
+        ]
+
+        return transformed
+
+    def process_files(self, first_part_file, second_part_file, output_file):
+        # Analyze parts and set up transformation
+        self.analyze_first_part(first_part_file)
+        self.analyze_second_part(second_part_file)
+        self.get_transformation_matrices()
+
+        with open(output_file, 'w') as outfile:
+            # Copy first part
+            with open(first_part_file, 'r') as first_part:
+                for line in first_part:
+                    outfile.write(line)
+
+            # Add transition commands with proper retraction
+            outfile.write('\n; Starting angled pipe connection\n')
+            outfile.write('G92 E0 ; Reset extruder\n')
+            outfile.write('G1 F2400 E-3 ; Retract filament\n')
+            outfile.write(f'G0 F5000 Z{self.first_part_max_z + 5} ; Lift Z\n\n')
+
+            # Process second part with transformations
+            with open(second_part_file, 'r') as second_part:
+                for line in second_part:
+                    processed_line = self.process_line(line)
+                    if processed_line:
+                        outfile.write(processed_line + '\n')
 
     def process_line(self, line):
-        if line.startswith(';LAYER:'):
-            self.current_layer = int(line.split(':')[1])
+        """Process a single line of G-code"""
+        if line.startswith('G0 ') or line.startswith('G1 '):
+            return self.transform_movement(line)
+        elif line.startswith(';'):
             return line.strip()
-        elif line.startswith('G1 '):
-            return self.adjust_coordinates_and_flow(line)
-        return line.strip()
+        else:
+            return line.strip()
 
-    def adjust_coordinates_and_flow(self, line):
-        match = re.search(r'X([-\d.]+)\s*Y([-\d.]+)\s*Z([-\d.]+)(\s*E([-\d.]+))?', line)
-        if match:
-            x, y, z = map(float, match.group(1, 2, 3))
-            e = float(match.group(5)) if match.group(5) else None
+    def analyze_second_part(self, filename):
+        """Analyze second part for minimum Z height"""
+        with open(filename, 'r') as file:
+            for line in file:
+                if line.startswith('G0 ') or line.startswith('G1 '):
+                    z_match = re.search(r'Z([-\d.]+)', line)
+                    if z_match:
+                        z = float(z_match.group(1))
+                        self.min_z_second_part = min(self.min_z_second_part, z)
 
-            # Get the current layer's angle
-            layer_z, layer_angle = self.layers[self.current_layer]
+    def transform_movement(self, line):
+        """Transform a movement command for angled pipe connection"""
+        coords = {'X': None, 'Y': None, 'Z': None, 'E': None, 'F': None}
 
-            # Calculate new coordinates based on pipe bending
-            new_x = x * math.cos(layer_angle) - z * math.sin(layer_angle)
-            new_z = x * math.sin(layer_angle) + z * math.cos(layer_angle)
+        for param in coords.keys():
+            match = re.search(f'{param}([-\d.]+)', line)
+            if match:
+                coords[param] = float(match.group(1))
 
-            # Adjust flow (E) based on the new position
-            if e is not None:
-                # Calculate the arc length ratio for flow adjustment
-                outer_radius = self.pipe_radius + x
-                inner_radius = self.pipe_radius - x
-                arc_length_ratio = outer_radius / inner_radius
-                new_e = e * arc_length_ratio
+        if all(v is None for v in [coords['X'], coords['Y'], coords['Z']]):
+            return line.strip()
 
-                return f"G1 X{new_x:.3f} Y{y:.3f} Z{new_z:.3f} E{new_e:.5f}"
-            else:
-                return f"G1 X{new_x:.3f} Y{y:.3f} Z{new_z:.3f}"
-        return line.strip()
+        x = coords['X'] if coords['X'] is not None else self.pivot_x
+        y = coords['Y'] if coords['Y'] is not None else self.pivot_y
+        z = coords['Z'] if coords['Z'] is not None else self.min_z_second_part
+
+        new_point = self.transform_point(x, y, z)
+
+        command = line[:2]
+        parts = []
+
+        if coords['X'] is not None:
+            parts.append(f'X{new_point[0]:.3f}')
+        if coords['Y'] is not None:
+            parts.append(f'Y{new_point[1]:.3f}')
+        if coords['Z'] is not None:
+            parts.append(f'Z{new_point[2]:.3f}')
+        if coords['E'] is not None:
+            parts.append(f'E{coords["E"]:.5f}')
+        if coords['F'] is not None:
+            parts.append(f'F{coords["F"]}')
+
+        return command + ' ' + ' '.join(parts)
+
 
 
 def main():
-    pipe_radius = 50  # Radius of the pipe in mm
-    bend_angle = 90  # Total bend angle of the pipe in degrees
-    input_file = 'input.gcode'
-    output_file = 'output.gcode'
+    first_part_file = 'part1.gcode'
+    second_part_file = 'part2.gcode'
+    output_file = 'combined_tilted_output.gcode'
 
-    processor = GCodePostProcessor(pipe_radius, bend_angle)
-    processor.process_file(input_file, output_file)
-    print(f"Processed G-code saved to {output_file}")
+    processor = GCodePipeConnector(tilt_angle_degrees=45)
+    processor.process_files(first_part_file, second_part_file, output_file)
+    print(f"Combined G-code with tilted base saved to {output_file}")
 
 
 if __name__ == "__main__":
