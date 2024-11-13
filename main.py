@@ -26,7 +26,7 @@ def merge_gcode(p1, p2, p3, output_file):
 
         # Process second part
         with open(p2, 'r') as infile:
-            outfile.write(f'G87 X0 Y0 Z{max_heights[0]} A0 B45 C0\n')
+            outfile.write(f'G87 X0 Y0 Z{max_heights[0]} A0 B30 C0\n')
             for line in infile:
                 parts = line.split()
                 if len(parts) >= 4 and (parts[0] == 'G1' or parts[0] == 'G0'):
@@ -36,7 +36,7 @@ def merge_gcode(p1, p2, p3, output_file):
 
         # Process third part
         with open(p3, 'r') as infile:
-            outfile.write(f'G87 X0 Y0 Z{max_heights[1]} A0 B-30 C0\n')
+            outfile.write(f'G87 X0 Y0 Z{max_heights[1]} A0 B-15 C0\n')
             for line in infile:
                 parts = line.split()
                 if len(parts) >= 4 and (parts[0] == 'G1' or parts[0] == 'G0'):
@@ -46,4 +46,4 @@ def merge_gcode(p1, p2, p3, output_file):
 
 
 # Example usage
-merge_gcode('p1.gcode', 'p2.gcode', 'p3.gcode', 'merged_output.gcode')
+merge_gcode('p1_t.gcode', 'p2_t.gcode', 'p3_t.gcode', 'merged_output_t.gcode')
